@@ -54,8 +54,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libsecret-1-dev fakeroot dpkg-dev rpm xvfb xauth
 
+      # Ubuntu's compiler defines _FORTIFY_SOURCE itself, so the
+      # -D_FORTIFY_SOURCE=1 in printenvz's build is a redefinition, which its
+      # -Werror makes fatal.
       - name: Install dependencies
         run: yarn install --frozen-lockfile
+        env:
+          CFLAGS: -Wno-error
 
       - name: Build
         run: yarn build:prod
@@ -111,8 +116,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsecret-1-dev xvfb xauth
 
+      # Ubuntu's compiler defines _FORTIFY_SOURCE itself, so the
+      # -D_FORTIFY_SOURCE=1 in printenvz's build is a redefinition, which its
+      # -Werror makes fatal.
       - name: Install dependencies
         run: yarn install --frozen-lockfile
+        env:
+          CFLAGS: -Wno-error
 
       - name: Build for end-to-end tests
         run: yarn test:e2e:build:packaged
