@@ -39,7 +39,7 @@ package() {
   rmdir --ignore-fail-on-non-empty "${pkgdir}/usr/lib"
 
   install -d "${pkgdir}/usr/bin"
-  ln -s "/opt/${_pkgname}/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
+  ln -sf "/opt/${_pkgname}/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
   chmod +x "${pkgdir}/opt/${_pkgname}/resources/app/static/github"
 
   sed -i "s|^Exec=.*|Exec=/usr/bin/${_pkgname} %U|" \
