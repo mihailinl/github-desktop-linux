@@ -33,6 +33,8 @@ export async function packageElectronBuilder(): Promise<Array<string>> {
   await build({
     prepackaged: distPath,
     config: configPath,
+    // Releases are created by the Linux release workflow, not here.
+    publish: 'never',
     ...getArchitecture(),
   })
 
