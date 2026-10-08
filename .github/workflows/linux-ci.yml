@@ -1,0 +1,129 @@
+name: Linux CI
+
+# Builds, tests and packages the Linux app. Runs on its own for pushes and
+# pull requests, and is called by the release and upstream sync workflows.
+
+on:
+  push:
+    branches:
+      - linux
+  pull_request:
+    branches:
+      - linux
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+            uname: x86_64
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            uname: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsecret-1-dev fakeroot dpkg-dev rpm xvfb xauth
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build
+        run: yarn build:prod
+
+      - name: Unit tests
+        if: matrix.arch == 'x64'
+        run: yarn test:unit
+
+      - name: Package
+        run: yarn package
+
+      - name: Archive app as tar.gz
+        run: |
+          version="$(node -p "require('./app/package.json').version")"
+          tar -C dist -czf "dist/GitHubDesktop-linux-${{ matrix.uname }}-${version}.tar.gz" \
+            --transform "s|^github-desktop-linux-${{ matrix.arch }}|github-desktop|" \
+            "github-desktop-linux-${{ matrix.arch }}"
+
+      - name: Smoke test packaged app
+        run: |
+          script/linux/smoke-test.sh "dist/github-desktop-linux-${{ matrix.arch }}/github-desktop"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/GitHubDesktop-linux-*.AppImage
+            dist/GitHubDesktop-linux-*.deb
+            dist/GitHubDesktop-linux-*.rpm
+            dist/GitHubDesktop-linux-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  e2e:
+    name: End-to-end test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsecret-1-dev xvfb xauth
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build for end-to-end tests
+        run: yarn test:e2e:build:packaged
+
+      # The auto-update tests do not apply: Linux builds have no updater.
+      - name: Run app launch test
+        run: xvfb-run -a yarn test:e2e:run:packaged --grep "App Launch"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-videos
+          path: playwright-videos
+          retention-days: 7

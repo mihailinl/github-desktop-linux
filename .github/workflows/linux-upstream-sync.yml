@@ -1,0 +1,190 @@
+name: Upstream sync
+
+# Every 6 hours, looks for a new stable GitHub Desktop release, merges it into
+# the linux branch on a sync/<tag> branch, builds and tests it, and only then
+# moves linux forward and publishes the release. When the merge has conflicts
+# or anything fails, it opens an upstream-sync issue and the linux branch stays
+# as it was.
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description:
+          Upstream tag to merge (default is the latest stable release)
+        type: string
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: Merge upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+      merged: ${{ steps.merge.outputs.merged }}
+      sha: ${{ steps.merge.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # Keeps the token so the sync branch can be pushed. Nothing from the
+      # merged code is executed in this job; yarn runs with --ignore-scripts.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: linux
+          fetch-depth: 0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Find upstream release
+        id: find
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$(gh api repos/desktop/desktop/releases/latest --jq .tag_name)}"
+          if [[ ! "$tag" =~ ^release-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream tag '$tag'"
+            exit 1
+          fi
+          git fetch --no-tags https://github.com/desktop/desktop.git "refs/tags/$tag:refs/tags/$tag"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+
+      - name: Merge
+        id: merge
+        env:
+          TAG: ${{ steps.find.outputs.tag }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if git merge-base --is-ancestor "$TAG" HEAD; then
+            echo "linux already contains $TAG"
+            echo "merged=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          title="Upstream $TAG needs a manual merge"
+          if gh issue list --label upstream-sync --state open --json title \
+            --jq '.[].title' | grep -qxF "$title"; then
+            echo "An open issue is already tracking $TAG; skipping"
+            echo "merged=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          status=0
+          script/linux/merge-upstream.sh "$TAG" || status=$?
+
+          if [[ $status -eq 0 ]]; then
+            git push --force origin "HEAD:refs/heads/sync/$TAG"
+            echo "merged=true" >>"$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ $status -ne 2 ]]; then
+            exit "$status"
+          fi
+
+          conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/')"
+          git merge --abort
+          cat >issue.md <<EOF
+          GitHub Desktop **$TAG** is out, but merging it into \`linux\` left conflicts that need a person or an agent:
+
+          $conflicts
+
+          \`package.json\`, \`app/package.json\` and the lockfiles are settled by the script; only the files above need work.
+
+          To resolve:
+
+          \`\`\`
+          git fetch --no-tags https://github.com/desktop/desktop.git "refs/tags/$TAG:refs/tags/$TAG"
+          git switch -c sync/$TAG origin/linux
+          script/linux/merge-upstream.sh $TAG
+          # fix the files above, keeping upstream's changes and the Linux behaviour
+          git add <files>
+          git commit --no-edit
+          \`\`\`
+
+          Then open a pull request into \`linux\` whose description says "Fixes #<this issue>". CI builds and tests it; once it is merged, the release is published automatically.
+
+          Run: $run_url
+          EOF
+          script/linux/open-issue.sh "$title" issue.md
+
+  build:
+    name: Build
+    needs: merge
+    if: needs.merge.outputs.merged == 'true'
+    uses: ./.github/workflows/linux-ci.yml
+    with:
+      ref: ${{ needs.merge.outputs.sha }}
+    permissions:
+      contents: read
+
+  promote:
+    name: Move linux forward
+    needs: [merge, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ needs.merge.outputs.sha }}
+      TAG: ${{ needs.merge.outputs.tag }}
+    steps:
+      # force=false: fails instead of overwriting if linux moved meanwhile.
+      - run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/linux" \
+            -f sha="$SHA" -F force=false >/dev/null
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/sync/$TAG" || true
+          echo "linux is now at $SHA ($TAG)"
+
+  release:
+    name: Release
+    needs: promote
+    uses: ./.github/workflows/linux-release.yml
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+  report:
+    name: Report failure
+    needs: [merge, build, promote, release]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.merge.outputs.tag || 'release' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: linux
+          persist-credentials: false
+
+      - run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          cat >issue.md <<EOF
+          Syncing upstream **$TAG** failed. See the failed jobs in the run: $run_url
+
+          - If the merge, build or tests failed, \`linux\` was not changed. A clean merge is kept on the branch \`sync/$TAG\`: fix it there and open a pull request into \`linux\` that says "Fixes #<this issue>". The release follows the merge.
+          - If only the release failed, \`linux\` already has the merge: re-run the failed jobs or start the Linux release workflow.
+          EOF
+          script/linux/open-issue.sh "Upstream $TAG needs a manual merge" issue.md

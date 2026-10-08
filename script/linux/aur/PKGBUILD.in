@@ -1,0 +1,47 @@
+# Generated for each release of https://github.com/mihailinl/github-desktop-linux
+# and attached to it. Drop-in replacement for the AUR github-desktop-bin package.
+#
+# Unofficial community build of GitHub Desktop; not affiliated with GitHub.
+
+_pkgname=github-desktop
+pkgname=${_pkgname}-bin
+pkgver=@PKGVER@
+pkgrel=1
+_pkgver="${pkgver//_/-}"
+_tag="release-${_pkgver}"
+pkgdesc="GUI for managing Git and GitHub (unofficial Linux community build)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/mihailinl/github-desktop-linux"
+license=('MIT')
+depends=(
+  'curl'
+  'git'
+  'libsecret'
+  'libxss'
+  'nspr'
+  'nss'
+  'org.freedesktop.secrets'
+  'unzip'
+)
+provides=("${_pkgname}")
+conflicts=("${_pkgname}")
+options=('!strip' '!debug')
+source_x86_64=("${url}/releases/download/${_tag}/GitHubDesktop-linux-amd64-${_pkgver}.deb")
+source_aarch64=("${url}/releases/download/${_tag}/GitHubDesktop-linux-arm64-${_pkgver}.deb")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  bsdtar -xf data.tar.* -C "${pkgdir}"
+
+  install -d "${pkgdir}/opt"
+  mv "${pkgdir}/usr/lib/${_pkgname}" "${pkgdir}/opt/${_pkgname}"
+  rmdir --ignore-fail-on-non-empty "${pkgdir}/usr/lib"
+
+  install -d "${pkgdir}/usr/bin"
+  ln -s "/opt/${_pkgname}/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
+  chmod +x "${pkgdir}/opt/${_pkgname}/resources/app/static/github"
+
+  sed -i "s|^Exec=.*|Exec=/usr/bin/${_pkgname} %U|" \
+    "${pkgdir}/usr/share/applications/${_pkgname}.desktop"
+}

@@ -1,0 +1,12 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Problem that also happens on Windows or macOS
+    url: https://github.com/desktop/desktop/issues
+    about:
+      Report it to GitHub Desktop upstream; fixes there reach this build with
+      the next release.
+  - name: Known Linux issues and workarounds
+    url: https://github.com/mihailinl/github-desktop-linux/blob/linux/docs/known-issues.md#linux
+    about:
+      Check here first for keyring, white screen and terminal detection
+      problems.
