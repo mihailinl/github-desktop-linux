@@ -13,15 +13,39 @@ pkgdesc="GUI for managing Git and GitHub (unofficial Linux community build)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/mihailinl/github-desktop-linux"
 license=('MIT')
+# The libraries the app links against, plus a Secret Service for saving sign-ins.
 depends=(
+  'alsa-lib'
+  'at-spi2-core'
+  'cairo'
   'curl'
+  'dbus'
+  'expat'
+  'fontconfig'
+  'gcc-libs'
   'git'
+  'glib2'
+  'glibc'
+  'gtk3'
+  'libcups'
   'libsecret'
-  'libxss'
+  'libx11'
+  'libxcb'
+  'libxcomposite'
+  'libxdamage'
+  'libxext'
+  'libxfixes'
+  'libxkbcommon'
+  'libxrandr'
+  'mesa'
   'nspr'
   'nss'
   'org.freedesktop.secrets'
+  'pango'
+  'systemd-libs'
   'unzip'
+  'xdg-utils'
+  'zlib'
 )
 provides=("${_pkgname}")
 conflicts=("${_pkgname}")

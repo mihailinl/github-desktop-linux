@@ -108,6 +108,10 @@ jobs:
           pacman -U --noconfirm /tmp/pkg/github-desktop-bin-*.pkg.tar.zst
           desktop-file-validate /usr/share/applications/github-desktop.desktop
           test -x /usr/bin/github-desktop
+          if ldd /opt/github-desktop/github-desktop | grep 'not found'; then
+            echo "::error::Libraries missing from the PKGBUILD depends"
+            exit 1
+          fi
           # Containers block the user namespaces Chromium's sandbox needs.
           su builder -c "script/linux/smoke-test.sh /usr/bin/github-desktop --no-sandbox"
 
