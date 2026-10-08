@@ -62,7 +62,10 @@ merge resets the suffix to `-linux1`.
 ## Checking a build by hand
 
 ```sh
-yarn build:prod && yarn package
+script/linux/rebuild-process-proxy.sh
+yarn build:prod
+script/linux/check-binaries.sh dist/github-desktop-linux-x64 x64
+yarn package
 script/linux/smoke-test.sh dist/github-desktop-linux-x64/github-desktop
 script/linux/aur/make-pkgbuild.sh "$(node -p "require('./app/package.json').version")" dist
 ```
