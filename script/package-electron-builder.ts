@@ -2,14 +2,13 @@
 
 import * as path from 'path'
 import { promisify } from 'util'
-import { build, CliOptions } from 'electron-builder'
 
 import glob = require('glob')
 const globPromise = promisify(glob)
 
 import { getDistPath, getDistRoot } from './dist-info'
 
-function getArchitecture(): CliOptions {
+function getArchitecture() {
   const arch = process.env.npm_config_arch || process.arch
   switch (arch) {
     case 'arm64':
@@ -29,6 +28,8 @@ export async function packageElectronBuilder(): Promise<Array<string>> {
 
   // The API rather than the electron-builder CLI: with yarn classic's install
   // layout, the CLI's yargs loads the ESM-only string-width 5 and crashes.
+  // Loaded untyped because electron-builder's typings need @types/yargs.
+  const { build } = require('electron-builder')
   await build({
     prepackaged: distPath,
     config: configPath,
