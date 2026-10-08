@@ -173,7 +173,7 @@ jobs:
 
           \`\`\`
           gh attestation verify <file> --repo $repo
-          sha256sum -c SHA256SUMS
+          sha256sum -c SHA256SUMS --ignore-missing
           \`\`\`
           NOTES
 
