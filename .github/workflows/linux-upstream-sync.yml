@@ -2,9 +2,12 @@ name: Upstream sync
 
 # Every 6 hours, looks for a new stable GitHub Desktop release, merges it into
 # the linux branch on a sync/<tag> branch, builds and tests it, and only then
-# moves linux forward and publishes the release. When the merge has conflicts
-# or anything fails, it opens an upstream-sync issue and the linux branch stays
-# as it was.
+# moves linux forward and publishes the release.
+#
+# When the merge has conflicts beyond versions and lockfiles, Claude resolves
+# them if the CLAUDE_CODE_OAUTH_TOKEN secret is set; the result goes through
+# the same build and tests. If that is not possible or anything fails, it opens
+# an upstream-sync issue and the linux branch stays as it was.
 
 on:
   schedule:
@@ -30,11 +33,16 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
-      issues: write
+      issues: read
     outputs:
       tag: ${{ steps.find.outputs.tag }}
+      linux: ${{ steps.merge.outputs.linux }}
+      base: ${{ steps.merge.outputs.base }}
       merged: ${{ steps.merge.outputs.merged }}
       sha: ${{ steps.merge.outputs.sha }}
+      conflict: ${{ steps.merge.outputs.conflict }}
+      conflicts: ${{ steps.merge.outputs.conflicts }}
+      agent: ${{ steps.merge.outputs.agent }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -66,8 +74,8 @@ jobs:
         id: merge
         env:
           TAG: ${{ steps.find.outputs.tag }}
+          HAS_AGENT_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
         run: |
-          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           if git merge-base --is-ancestor "$TAG" HEAD; then
             echo "linux already contains $TAG"
             echo "merged=false" >>"$GITHUB_OUTPUT"
@@ -81,6 +89,11 @@ jobs:
             echo "merged=false" >>"$GITHUB_OUTPUT"
             exit 0
           fi
+
+          {
+            echo "linux=$(git rev-parse HEAD)"
+            echo "base=$(git merge-base HEAD "$TAG")"
+          } >>"$GITHUB_OUTPUT"
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -99,12 +112,265 @@ jobs:
             exit "$status"
           fi
 
-          conflicts="$(git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/')"
+          {
+            echo "merged=false"
+            echo "conflict=true"
+            echo "agent=$HAS_AGENT_TOKEN"
+            echo "conflicts<<EOF_CONFLICTS"
+            git diff --name-only --diff-filter=U
+            echo "EOF_CONFLICTS"
+          } >>"$GITHUB_OUTPUT"
           git merge --abort
-          cat >issue.md <<EOF
-          GitHub Desktop **$TAG** is out, but merging it into \`linux\` left conflicts that need a person or an agent:
 
-          $conflicts
+  resolve:
+    name: Resolve conflicts with Claude
+    needs: merge
+    if:
+      needs.merge.outputs.conflict == 'true' && needs.merge.outputs.agent ==
+      'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Read-only: the resolved merge leaves this job as a bundle, and the push
+    # job checks it before pushing. Claude gets file tools only, no shell.
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.merge.outputs.tag }}
+      BASE: ${{ needs.merge.outputs.base }}
+      LINUX: ${{ needs.merge.outputs.linux }}
+      CONFLICTS: ${{ needs.merge.outputs.conflicts }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.merge.outputs.linux }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+
+      - name: Start the merge
+        run: |
+          git fetch --no-tags https://github.com/desktop/desktop.git "refs/tags/$TAG:refs/tags/$TAG"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          status=0
+          script/linux/merge-upstream.sh "$TAG" || status=$?
+          if [[ $status -ne 2 ]]; then
+            echo "::error::Expected merge conflicts, got exit code $status"
+            exit 1
+          fi
+
+          printf '%s\n' "$CONFLICTS" >"$RUNNER_TEMP/conflicts.txt"
+          git ls-files -s | awk -F'\t' 'NR==FNR{c[$0]=1;next} !($2 in c)' \
+            "$RUNNER_TEMP/conflicts.txt" - >"$RUNNER_TEMP/index-before.txt"
+          tar -C .git -cf "$RUNNER_TEMP/git-meta.tar" config hooks info
+
+          while IFS= read -r file; do
+            dir=".sync-context/$file"
+            mkdir -p "$dir"
+            git log --oneline "$BASE..$TAG" -- "$file" >"$dir/upstream-commits.txt"
+            git diff "$BASE" "$TAG" -- "$file" >"$dir/upstream.diff"
+            git diff "$BASE" "$LINUX" -- "$file" >"$dir/linux.diff"
+            git show "$TAG:$file" >"$dir/upstream-version" 2>/dev/null || true
+            git show "$LINUX:$file" >"$dir/linux-version" 2>/dev/null || true
+          done <"$RUNNER_TEMP/conflicts.txt"
+
+      - uses: anthropics/claude-code-action@6fed3ca145920b639991cb756090506e1bcaf515 # v1.0.245
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          claude_args: >-
+            --model opus --max-turns 100 --allowedTools
+            "Read,Edit,Write,Glob,Grep"
+          prompt: |
+            GitHub Desktop upstream release ${{ needs.merge.outputs.tag }} is being merged into the `linux` branch of a community Linux build of GitHub Desktop. These files have merge conflicts, marked with <<<<<<< / ======= / >>>>>>> (ours is linux, theirs is upstream):
+
+            ${{ needs.merge.outputs.conflicts }}
+
+            Everything else, including package.json, app/package.json and the lockfiles, is already merged. Do not change any other file.
+
+            For each conflicted file, `.sync-context/<file>/` has:
+
+            - `upstream.diff` and `upstream-commits.txt`: what upstream changed since the last merged release.
+            - `linux.diff`: the Linux patches compared with upstream. Most are guarded by `__LINUX__` or concern Linux packaging.
+            - `upstream-version` and `linux-version`: both sides in full.
+
+            Edit each conflicted file so it has upstream's changes and keeps the Linux behaviour. Remove every conflict marker and follow the file's existing style. Do not build or run anything; CI builds and tests the result.
+
+            If a conflict cannot be resolved without guessing what either side meant, leave its conflict markers in place and explain why in your final message; a person will finish it.
+
+      - name: Check and commit the resolution
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: 1
+        run: |
+          # Undo anything written into git's own configuration or hooks.
+          rm -rf .git/config .git/hooks .git/info .sync-context
+          tar -C .git -xf "$RUNNER_TEMP/git-meta.tar"
+
+          while IFS= read -r file; do
+            if [[ -e "$file" ]] && grep -nE '^(<<<<<<<|=======|>>>>>>>)( |$)' "$file"; then
+              echo "::error file=$file::Conflict markers left"
+              exit 1
+            fi
+          done <"$RUNNER_TEMP/conflicts.txt"
+
+          outside="$(git diff --name-only | grep -vxFf "$RUNNER_TEMP/conflicts.txt" || true)"
+          if [[ -n "$outside" ]]; then
+            echo "::error::Files outside the conflicts were changed"
+            git diff --stat
+            exit 1
+          fi
+          while IFS= read -r file; do
+            if [[ -e "$file" ]]; then git add -- "$file"; else git rm -q --cached -- "$file"; fi
+          done <"$RUNNER_TEMP/conflicts.txt"
+
+          git ls-files -s | awk -F'\t' 'NR==FNR{c[$0]=1;next} !($2 in c)' \
+            "$RUNNER_TEMP/conflicts.txt" - >"$RUNNER_TEMP/index-after.txt"
+          if ! diff "$RUNNER_TEMP/index-before.txt" "$RUNNER_TEMP/index-after.txt"; then
+            echo "::error::Files outside the conflicts were staged"
+            exit 1
+          fi
+          if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+            echo "::error::Still conflicted"
+            exit 1
+          fi
+
+          tree="$(git write-tree)"
+          git commit --no-verify -q -m "Merge upstream $TAG" \
+            -m "Conflicts resolved by Claude in the upstream sync workflow:" \
+            -m "$(sed 's/^/- /' "$RUNNER_TEMP/conflicts.txt")"
+          if [[ "$(git rev-parse 'HEAD^{tree}')" != "$tree" ]]; then
+            echo "::error::The commit does not match the checked index"
+            exit 1
+          fi
+          git bundle create "$RUNNER_TEMP/sync.bundle" "$LINUX..HEAD"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sync-bundle
+          path: ${{ runner.temp }}/sync.bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  push-resolution:
+    name: Push resolved merge
+    needs: [merge, resolve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.push.outputs.sha }}
+    env:
+      TAG: ${{ needs.merge.outputs.tag }}
+      LINUX: ${{ needs.merge.outputs.linux }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.merge.outputs.linux }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sync-bundle
+          path: ${{ runner.temp }}
+
+      # Pushes only a merge commit whose parents are the linux commit the
+      # merge started from and the upstream tag.
+      - id: push
+        run: |
+          git fetch --no-tags https://github.com/desktop/desktop.git "refs/tags/$TAG:refs/tags/$TAG"
+          git fetch "$RUNNER_TEMP/sync.bundle" HEAD:refs/heads/resolved
+          if [[ "$(git rev-parse resolved^1)" != "$LINUX" ||
+            "$(git rev-parse resolved^2)" != "$(git rev-parse "$TAG^{commit}")" ||
+            -n "$(git rev-parse --verify -q resolved^3)" ]]; then
+            echo "::error::The resolved commit is not a merge of linux and $TAG"
+            exit 1
+          fi
+          git push --force origin "resolved:refs/heads/sync/$TAG"
+          echo "sha=$(git rev-parse resolved)" >>"$GITHUB_OUTPUT"
+
+  build:
+    name: Build
+    needs: [merge, push-resolution]
+    if: >-
+      !cancelled() && (needs.merge.outputs.merged == 'true' ||
+      needs.push-resolution.result == 'success')
+    uses: ./.github/workflows/linux-ci.yml
+    with:
+      ref: ${{ needs.merge.outputs.sha || needs.push-resolution.outputs.sha }}
+    permissions:
+      contents: read
+
+  promote:
+    name: Move linux forward
+    needs: [merge, push-resolution, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ needs.merge.outputs.sha || needs.push-resolution.outputs.sha }}
+      TAG: ${{ needs.merge.outputs.tag }}
+    steps:
+      # force=false: fails instead of overwriting if linux moved meanwhile.
+      - run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/linux" \
+            -f sha="$SHA" -F force=false >/dev/null
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/sync/$TAG" || true
+          echo "linux is now at $SHA ($TAG)"
+
+  release:
+    name: Release
+    needs: promote
+    if: ${{ !cancelled() && needs.promote.result == 'success' }}
+    uses: ./.github/workflows/linux-release.yml
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+  report:
+    name: Ask for a manual merge
+    needs: [merge, resolve, push-resolution, build, promote, release]
+    if: >-
+      !cancelled() && (failure() || (needs.merge.outputs.conflict == 'true' &&
+      needs.push-resolution.result != 'success'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.merge.outputs.tag || 'release' }}
+      CONFLICT: ${{ needs.merge.outputs.conflict }}
+      CONFLICTS: ${{ needs.merge.outputs.conflicts }}
+      AGENT: ${{ needs.merge.outputs.agent }}
+      RESOLVED: ${{ needs.push-resolution.result == 'success' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: linux
+          persist-credentials: false
+
+      - run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [[ "$CONFLICT" == true && "$RESOLVED" != true ]]; then
+            if [[ "$AGENT" == true ]]; then
+              who="Claude could not resolve them (see the run)."
+            else
+              who="No agent ran: the \`CLAUDE_CODE_OAUTH_TOKEN\` secret is not set."
+            fi
+            # shellcheck disable=SC2016 # the backticks are Markdown
+            files="$(printf '%s\n' "$CONFLICTS" | sed 's/^/- `/; s/$/`/')"
+            cat >issue.md <<EOF
+          GitHub Desktop **$TAG** is out, but merging it into \`linux\` left conflicts that need a person. $who
+
+          $files
 
           \`package.json\`, \`app/package.json\` and the lockfiles are settled by the script; only the files above need work.
 
@@ -119,72 +385,16 @@ jobs:
           git commit --no-edit
           \`\`\`
 
-          Then open a pull request into \`linux\` whose description says "Fixes #<this issue>". CI builds and tests it; once it is merged, the release is published automatically.
+          Then open a pull request into \`linux\` whose description says "Fixes #<this issue>" and merge it with a merge commit. CI builds and tests it; once it is merged, the release is published automatically. Details: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/linux/docs/process/maintaining-linux-builds.md
 
           Run: $run_url
           EOF
-          script/linux/open-issue.sh "$title" issue.md
-
-  build:
-    name: Build
-    needs: merge
-    if: needs.merge.outputs.merged == 'true'
-    uses: ./.github/workflows/linux-ci.yml
-    with:
-      ref: ${{ needs.merge.outputs.sha }}
-    permissions:
-      contents: read
-
-  promote:
-    name: Move linux forward
-    needs: [merge, build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      SHA: ${{ needs.merge.outputs.sha }}
-      TAG: ${{ needs.merge.outputs.tag }}
-    steps:
-      # force=false: fails instead of overwriting if linux moved meanwhile.
-      - run: |
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/linux" \
-            -f sha="$SHA" -F force=false >/dev/null
-          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/sync/$TAG" || true
-          echo "linux is now at $SHA ($TAG)"
-
-  release:
-    name: Release
-    needs: promote
-    uses: ./.github/workflows/linux-release.yml
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-
-  report:
-    name: Report failure
-    needs: [merge, build, promote, release]
-    if: failure()
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      TAG: ${{ needs.merge.outputs.tag || 'release' }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: linux
-          persist-credentials: false
-
-      - run: |
-          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          cat >issue.md <<EOF
+          else
+            cat >issue.md <<EOF
           Syncing upstream **$TAG** failed. See the failed jobs in the run: $run_url
 
-          - If the merge, build or tests failed, \`linux\` was not changed. A clean merge is kept on the branch \`sync/$TAG\`: fix it there and open a pull request into \`linux\` that says "Fixes #<this issue>". The release follows the merge.
+          - If the merge, build or tests failed, \`linux\` was not changed. The merge is kept on the branch \`sync/$TAG\`: fix it there and open a pull request into \`linux\` that says "Fixes #<this issue>". The release follows the merge.
           - If only the release failed, \`linux\` already has the merge: re-run the failed jobs or start the Linux release workflow.
           EOF
+          fi
           script/linux/open-issue.sh "Upstream $TAG needs a manual merge" issue.md
