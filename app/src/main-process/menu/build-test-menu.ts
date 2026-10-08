@@ -119,6 +119,10 @@ export function buildTestMenu() {
       click: emit('test-notification'),
     },
     {
+      label: 'Dispatch CLI action',
+      click: emit('test-cli-action'),
+    },
+    {
       label: 'Show popup',
       submenu: [
         {
@@ -136,6 +140,14 @@ export function buildTestMenu() {
         {
           label: 'Octicons',
           click: emit('test-icons'),
+        },
+        {
+          label: 'About dialog (test mode)',
+          click: emit('test-about-dialog'),
+        },
+        {
+          label: 'Copilot snapshot card',
+          click: emit('test-copilot-snapshot-card'),
         },
       ],
     },

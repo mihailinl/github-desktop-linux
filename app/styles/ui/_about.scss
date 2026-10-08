@@ -33,6 +33,10 @@ dialog#about {
       }
     }
 
+    .terms-and-license-container {
+      margin-top: var(--spacing);
+    }
+
     .version-text {
       cursor: pointer;
       .octicon {
@@ -57,14 +61,15 @@ dialog#about {
   }
 
   .update-status {
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+    text-align: center;
+    margin-bottom: var(--spacing);
     .octicon.spin {
       // Make sure the spinner is aligned with the text.
       align-self: center;
-
-      // Tighten up the spacing between the spinner and the text
-      &:not(:last-child) {
-        margin-right: 3px;
-      }
+      margin-right: 3px;
     }
   }
 }

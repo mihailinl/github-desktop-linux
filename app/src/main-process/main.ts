@@ -4,6 +4,7 @@ import {
   app,
   Menu,
   BrowserWindow,
+  dialog,
   shell,
   session,
   systemPreferences,
@@ -107,7 +108,7 @@ function getExtraErrorContext(): Record<string, string> {
 const protocolLauncherArg = '--protocol-launcher'
 
 const possibleProtocols = new Set(['x-github-client'])
-if (__DEV__) {
+if (__DEV_SECRETS__) {
   possibleProtocols.add('x-github-desktop-dev-auth')
 } else {
   possibleProtocols.add('x-github-desktop-auth')
@@ -240,7 +241,9 @@ if (__DARWIN__) {
 }
 
 async function handleCommandLineArguments(argv: string[]) {
-  const args = parseCommandLineArgs(argv)
+  const args = parseCommandLineArgs(argv, {
+    boolean: ['protocol-launcher'],
+  })
 
   // TODO(@shiftkey): see if we can convert this area to use args shape
 
@@ -248,8 +251,38 @@ async function handleCommandLineArguments(argv: string[]) {
   // `[executable path] --protocol-launcher "%1"`. Note that extra command
   // line arguments might be added by Chromium
   // (https://electronjs.org/docs/api/app#event-second-instance).
-  if (__WIN32__ && typeof args['protocol-launcher'] === 'string') {
-    handleAppURL(args['protocol-launcher'])
+
+  if (__WIN32__ && args['protocol-launcher'] === true) {
+    // On Windows we'll end up getting called with something like
+    // `--protocol-launcher --allow-file-access-from-files x-github-client://..`
+    // which minimist naturally interprets as
+    // `--allow-file-access-from-files=x:/github-client`. This is due to
+    // Chromium's hot take on parsing command line arguments, see:
+    // https://github.com/electron/electron/issues/20322#issuecomment-534137321
+    // So while we could add '--allow-file...' as a boolean we can't know for
+    // sure that Chromium won't add more switches later on which is why we have
+    // to resort to looking through all arguments looking for something that
+    // appears to be an app url.
+    const prefixes = Array.from(possibleProtocols, p => `${p}://`)
+    const matchingUrl = argv.find(arg => {
+      if (prefixes.some(p => arg.startsWith(p))) {
+        try {
+          new URL(arg)
+          return true
+        } catch (e) {
+          log.error(`Unable to parse argument as URL: ${arg}`)
+        }
+      }
+      return false
+    })
+
+    if (matchingUrl) {
+      handleAppURL(matchingUrl)
+    } else {
+      log.error(`Encountered --protocol-launcher without app url`)
+    }
+    // If --protocol-launcher is present we always want to bail and not
+    // risk a smuggled cli switch
     return
   } else if (__LINUX__) {
     // we expect this call to have several parameters before the URL we want,
@@ -603,6 +636,11 @@ app.on('ready', () => {
   ipcMain.handle('get-app-path', async () => app.getAppPath())
 
   /**
+   * An event sent by the renderer asking for the executable path
+   */
+  ipcMain.handle('get-exec-path', async () => process.execPath)
+
+  /**
    * An event sent by the renderer asking for whether the app is running under
    * rosetta translation
    */
@@ -622,6 +660,26 @@ app.on('ready', () => {
   ipcMain.handle('show-item-in-folder', async (_, path) =>
     shell.showItemInFolder(path)
   )
+  ipcMain.handle('confirm-reveal-directory', async event => {
+    const window = BrowserWindow.fromWebContents(event.sender)
+    const options: Electron.MessageBoxOptions = {
+      type: 'warning',
+      title: 'Reveal Repository in Finder?',
+      message: 'This repository might be an application.',
+      detail:
+        'Opening it directly could run software. You can reveal and select it in Finder without opening it.',
+      buttons: ['Reveal in Finder', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    }
+    const result =
+      window === null
+        ? await dialog.showMessageBox(options)
+        : await dialog.showMessageBox(window, options)
+
+    return result.response === 0
+  })
 
   ipcMain.on('unsafe-open-directory', async (_, path) =>
     UNSAFE_openDirectory(path)
@@ -762,18 +820,17 @@ function createWindow() {
 
     const axeDevTools = {
       id: 'lhdoppojpmngadmnindnejefpokejbdd',
-      electron: '>=1.2.1',
-      Permissions: ['tabs', 'debugger'],
     }
 
     const extensions = [REACT_DEVELOPER_TOOLS, axeDevTools]
 
-    for (const extension of extensions) {
-      try {
-        installExtension(extension, {
-          loadExtensionOptions: { allowFileAccess: true },
-        })
-      } catch (e) {}
+    try {
+      installExtension(extensions, {
+        loadExtensionOptions: { allowFileAccess: true },
+      })
+      console.log('Added Extensions: "React Developer Tools", "axe DevTools"')
+    } catch (e) {
+      console.log('An error occurred while loading extensions: ', e)
     }
   }
 
